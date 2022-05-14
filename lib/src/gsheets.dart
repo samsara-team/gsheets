@@ -7,6 +7,7 @@ import 'dart:typed_data';
 import 'package:collection/collection.dart' show IterableExtension;
 import 'package:googleapis/sheets/v4.dart';
 import 'package:googleapis_auth/auth_io.dart';
+import 'package:gsheets/gsheets.dart';
 import 'package:http/http.dart' as http;
 
 import 'a1_ref.dart';
@@ -196,14 +197,28 @@ class GSheets {
     String spreadsheetId, {
     ValueRenderOption render = ValueRenderOption.unformattedValue,
     ValueInputOption input = ValueInputOption.userEntered,
+    bool useCache = false
   }) async {
     final client = await this.client.catchError((_) {
       // retry once on error
       _client = null;
       return this.client;
     });
-    final response = await client.get('$_sheetsEndpoint$spreadsheetId'.toUri());
+
+    final endpoint = useCache ? '$_sheetsEndpoint$spreadsheetId?includeGridData=true' : '$_sheetsEndpoint$spreadsheetId';
+
+    final response = await client.get(endpoint.toUri());
     checkResponse(response);
+
+    if (useCache) {
+      return Spreadsheet._fromFullJson(
+        json: jsonDecode(response.body),
+        client: client,
+        renderOption: _parseRenderOption(render),
+        inputOption: _parseInputOption(input),
+      );
+    }
+
     return Spreadsheet._fromJson(
       json: jsonDecode(response.body),
       client: client,
@@ -458,6 +473,37 @@ class Spreadsheet {
     );
   }
 
+  factory Spreadsheet._fromFullJson({
+    required Map<String, dynamic> json,
+    required AutoRefreshingAuthClient client,
+    required String renderOption,
+    required String inputOption,
+  }) {
+    print('Spreadsheet._fromFullJson');
+
+    final spreadsheetId = json['spreadsheetId'];
+    final spreadsheetUrl = json['spreadsheetUrl'];
+    final data = SpreadsheetData._fromJson(json);
+    final sheets = (json['sheets'] as List)
+        .map((json) => Worksheet._fromFullGridJson(
+      json,
+      client,
+      spreadsheetId,
+      renderOption,
+      inputOption,
+    )).toList();
+
+    return Spreadsheet._(
+      client,
+      spreadsheetId,
+      spreadsheetUrl,
+      data,
+      sheets,
+      renderOption,
+      inputOption,
+    );
+  }
+
   /// Applies one or more updates to the spreadsheet.
   /// [About batchUpdate](https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/batchUpdate)
   ///
@@ -530,6 +576,7 @@ class Spreadsheet {
   ///
   /// Returns `null` if [Worksheet] with [title] not found.
   Worksheet? worksheetByTitle(String title) {
+    print('worksheetByTitle');
     return sheets.firstWhereOrNull(
       (sheet) => sheet._title == title,
     );
@@ -912,6 +959,7 @@ class Worksheet {
   int _index;
   int _rowCount;
   int _columnCount;
+  List<List<Cell>>? gridCache;
 
   /// Current count of available rows.
   int get rowCount => _rowCount;
@@ -940,7 +988,9 @@ class Worksheet {
     this._rowCount,
     this._columnCount,
     this.renderOption,
-    this.inputOption,
+    this.inputOption, [
+      this.gridCache
+    ]
   );
 
   factory Worksheet._fromJson(
@@ -961,6 +1011,56 @@ class Worksheet {
       renderOption,
       inputOption,
     );
+  }
+
+  factory Worksheet._fromFullGridJson(
+      Map<String, dynamic> sheetJson,
+      AutoRefreshingAuthClient client,
+      String sheetsId,
+      String renderOption,
+      String inputOption,
+      ) {
+    print('Worksheet._fromFullGridJson');
+    var ws = Worksheet._(
+      client,
+      sheetsId,
+      sheetJson['properties']['sheetId'],
+      sheetJson['properties']['title'],
+      sheetJson['properties']['index'],
+      sheetJson['properties']['gridProperties']['rowCount'],
+      sheetJson['properties']['gridProperties']['columnCount'],
+      renderOption,
+      inputOption
+    );
+
+    try {
+      final grid = List<List<Cell>>.empty(growable: true);
+      sheetJson['data'][0]['rowData'].asMap().forEach((r, jsonRow) {
+        final row = List<Cell>.empty(growable: true);
+        print(jsonRow);
+        jsonRow['values'].asMap().forEach((c, jsonCell) =>
+            row.add(
+                Cell._(
+                    ws,
+                    r,
+                    c,
+                    jsonCell['effectiveValue'] == null ? '' : jsonCell['effectiveValue']['stringValue'],
+                    false
+                )
+            )
+        );
+
+        grid.add(row);
+      });
+
+      ws.gridCache = grid;
+      print(ws.gridCache);
+    } catch(e) {
+      print(e);
+    }
+
+
+    return ws;
   }
 
   @override
@@ -1345,8 +1445,13 @@ class Worksheet {
   Future<List<List<String>>> _getAll(
     String range,
     String dimension,
-    bool fill,
-  ) async {
+    bool fill, {
+      bool fromCache = false
+    }) async {
+    if (fromCache && gridCache != null) {
+      return gridCache!.map((c) => c.map((ct) => ct.value).toList()).toList();
+    }
+
     final encodedRange = Uri.encodeComponent(range);
 
     final response = await _client.get(
@@ -1521,8 +1626,8 @@ class WorksheetAsValues {
   Future<List<String>> column(
     int column, {
     int fromRow = 1,
-    int length = -1,
-  }) async {
+    int length = -1
+    }) async {
     checkIndex('column', column);
     checkIndex('fromRow', fromRow);
     final range = await _ws._columnRange(column, fromRow, length);
@@ -1549,7 +1654,7 @@ class WorksheetAsValues {
   Future<List<String>> row(
     int row, {
     int fromColumn = 1,
-    int length = -1,
+    int length = -1
   }) async {
     checkIndex('row', row);
     checkIndex('fromColumn', fromColumn);
@@ -1782,7 +1887,7 @@ class WorksheetAsValues {
     int fromColumn = 1,
     int length = -1,
     int count = -1,
-    bool fill = false,
+    bool fill = false
   }) async {
     checkIndex('fromColumn', fromColumn);
     checkIndex('fromRow', fromRow);
@@ -1810,7 +1915,7 @@ class WorksheetAsValues {
   /// Throws [GSheetsException].
   Future<String> value({
     required int column,
-    required int row,
+    required int row
   }) async {
     checkIndex('column', column);
     checkIndex('row', row);
@@ -3370,65 +3475,6 @@ class ValuesMapper {
   }
 }
 
-/// Representation of a [Cell].
-class Cell implements Comparable {
-  final Worksheet _ws;
-  final int row;
-  final int column;
-  String value;
-  final bool _insertable;
-
-  Cell._(
-    this._ws,
-    this.row,
-    this.column,
-    this.value, [
-    this._insertable = true,
-  ]);
-
-  /// Returns position of a cell in A1 notation.
-  late String label = '${A1Ref.getColumnLabel(column)}$row';
-
-  String get worksheetTitle => _ws._title;
-
-  /// Updates value of a cell.
-  ///
-  /// Returns Future `true` in case of success
-  ///
-  /// Throws [GSheetsException].
-  Future<bool> post(dynamic value) async {
-    final val = parseString(value);
-    if (this.value == val) return false;
-    final posted = await _ws._update(
-      values: [val],
-      range: "'$worksheetTitle'!$label",
-      majorDimension: dimenColumns,
-    );
-    if (posted) this.value = val;
-    return posted;
-  }
-
-  /// Refreshes value of a cell.
-  ///
-  /// Returns Future `true` if value has been changed.
-  ///
-  /// Throws [GSheetsException].
-  Future<bool> refresh() async {
-    final before = value;
-    final range = "'$worksheetTitle'!$label:$label";
-    value = getOrEmpty(await _ws._get(range, dimenColumns));
-    return before != value;
-  }
-
-  @override
-  String toString() => "'$value' at $label";
-
-  @override
-  int compareTo(other) {
-    return row + column - other.row - other.column as int;
-  }
-}
-
 /// Interactor for working with [Worksheet] cells as [Cell] objects.
 class WorksheetAsCells {
   final Worksheet _ws;
@@ -3741,7 +3787,12 @@ class WorksheetAsCells {
     int fromColumn = 1,
     int length = -1,
     int count = -1,
+    bool useCache = false
   }) async {
+    if (useCache && _ws.gridCache != null) {
+      return Future.value(_ws.gridCache);
+    }
+
     final rows = await _ws.values.allRows(
       fromRow: fromRow,
       fromColumn: fromColumn,
@@ -4225,4 +4276,88 @@ class CellsMapper {
   Future<bool> insert(Map<String, Cell> map) async {
     return _cells.insert(map.values.toList()..sort());
   }
+}
+
+/// Representation of a [Cell].
+class Cell implements Comparable {
+  final Worksheet _ws;
+  final int row;
+  final int column;
+  String value;
+  final CellFormat format;
+  final bool _insertable;
+
+  Cell._(
+      this._ws,
+      this.row,
+      this.column,
+      this.value, [
+        this._insertable = true,
+        this.format = const CellFormat._(Color._(1, 1, 1))
+      ]);
+
+  /// Returns position of a cell in A1 notation.
+  late String label = '${A1Ref.getColumnLabel(column)}$row';
+
+  String get worksheetTitle => _ws._title;
+
+  /// Updates value of a cell.
+  ///
+  /// Returns Future `true` in case of success
+  ///
+  /// Throws [GSheetsException].
+  Future<bool> post(dynamic value) async {
+    final val = parseString(value);
+    if (this.value == val) return false;
+    final posted = await _ws._update(
+      values: [val],
+      range: "'$worksheetTitle'!$label",
+      majorDimension: dimenColumns,
+    );
+    if (posted) this.value = val;
+    return posted;
+  }
+
+  /// Refreshes value of a cell.
+  ///
+  /// Returns Future `true` if value has been changed.
+  ///
+  /// Throws [GSheetsException].
+  Future<bool> refresh() async {
+    final before = value;
+    final range = "'$worksheetTitle'!$label:$label";
+    value = getOrEmpty(await _ws._get(range, dimenColumns));
+    return before != value;
+  }
+
+  @override
+  String toString() => "'$value' at $label";
+
+  @override
+  int compareTo(other) {
+    return row + column - other.row - other.column as int;
+  }
+}
+
+/// Representation of a [CellFormat].
+class CellFormat {
+  final Color backgroundColor;
+
+  const CellFormat._(this.backgroundColor);
+}
+
+/// Representation of a [Color].
+class Color {
+  final int    red;
+  final int    green;
+  final int    blue;
+  final double alpha;
+
+  const Color._(
+    this.red,
+    this.green,
+    this.blue, {
+        this.alpha = 1.0
+    }
+  );
 }
